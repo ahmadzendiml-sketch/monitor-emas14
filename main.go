@@ -212,7 +212,7 @@ func main() {
 	go usdIdrLoop()
 	go heartbeatLoop()
 
-	log.Fatal(app.Listen(":8000"))
+	log.Fatal(app.Listen(":8080"))
 }
 
 func wsHandler(c *websocket.Conn) {
@@ -903,3 +903,4 @@ th.waktu,td.waktu{width:60px;min-width:50px;max-width:70px}
 </script>
 </body>
 </html>`
+
