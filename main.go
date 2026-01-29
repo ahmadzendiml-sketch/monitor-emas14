@@ -68,9 +68,14 @@ type State struct {
 	LimitBulan    int64                    `json:"limit_bulan"`
 }
 
+type Client struct {
+	conn   *websocket.Conn
+	sendCh chan []byte
+}
+
 type ConnShard struct {
 	sync.RWMutex
-	conns map[*websocket.Conn]struct{}
+	clients map[*Client]struct{}
 }
 
 var (
@@ -115,7 +120,7 @@ func init() {
 	connShards = make([]*ConnShard, CONN_SHARDS)
 	for i := 0; i < CONN_SHARDS; i++ {
 		connShards[i] = &ConnShard{
-			conns: make(map[*websocket.Conn]struct{}, MAX_CONNECTIONS/CONN_SHARDS),
+			clients: make(map[*Client]struct{}, MAX_CONNECTIONS/CONN_SHARDS),
 		}
 	}
 	htmlBytes = []byte(htmlTemplate)
@@ -150,7 +155,6 @@ func rateLimitMiddleware(c *fiber.Ctx) error {
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 		Prefork:               false,
@@ -159,22 +163,18 @@ func main() {
 		Concurrency:           256 * 1024,
 		ReduceMemoryUsage:     false,
 	})
-
 	app.Use(rateLimitMiddleware)
 	app.Use(compress.New(compress.Config{Level: compress.LevelBestSpeed}))
-
 	app.Get("/", func(c *fiber.Ctx) error {
 		c.Set("Content-Type", "text/html; charset=utf-8")
 		c.Set("Cache-Control", "public, max-age=60")
 		return c.Send(htmlBytes)
 	})
-
 	app.Get("/api/state", func(c *fiber.Ctx) error {
 		c.Set("Content-Type", "application/json")
 		c.Set("Cache-Control", "no-cache")
 		return c.Send(getStateBytes())
 	})
-
 	app.Get("/aturTS/:value", func(c *fiber.Ctx) error {
 		ip := getClientIP(c)
 		if isIPBlocked(ip) {
@@ -199,83 +199,97 @@ func main() {
 		triggerBroadcast()
 		return c.JSON(fiber.Map{"status": "ok", "limit_bulan": atomic.LoadInt64(&limitBulan)})
 	})
-
 	app.Get("/ws", websocket.New(wsHandler, websocket.Config{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 2048,
 	}))
-
 	for i := 0; i < BROADCAST_WORKERS; i++ {
 		go broadcastWorker()
 	}
 	go apiLoop()
 	go usdIdrLoop()
 	go heartbeatLoop()
-
 	log.Fatal(app.Listen(":8080"))
 }
 
 func wsHandler(c *websocket.Conn) {
-	if !addConnection(c) {
+	client := &Client{
+		conn:   c,
+		sendCh: make(chan []byte, 8),
+	}
+	if !addConnection(client) {
 		c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1013, "Too many connections"))
 		c.Close()
 		return
 	}
-
 	c.SetReadLimit(512)
 	c.SetReadDeadline(time.Now().Add(60 * time.Second))
-
 	stateBytes := getStateBytes()
-	c.SetWriteDeadline(time.Now().Add(WS_WRITE_TIMEOUT))
-	c.WriteMessage(websocket.BinaryMessage, stateBytes)
-
+	select {
+	case client.sendCh <- stateBytes:
+	default:
+		removeConnection(client)
+		return
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		for msg := range client.sendCh {
+			c.SetWriteDeadline(time.Now().Add(WS_WRITE_TIMEOUT))
+			if err := c.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
 		for {
 			_, msg, err := c.ReadMessage()
 			if err != nil {
-				return
+				break
 			}
 			if len(msg) == 4 && string(msg) == "ping" {
-				c.SetWriteDeadline(time.Now().Add(WS_WRITE_TIMEOUT))
-				c.WriteMessage(websocket.BinaryMessage, []byte(`{"pong":true}`))
+				select {
+				case client.sendCh <- []byte(`{"pong":true}`):
+				default:
+				}
 			}
 			c.SetReadDeadline(time.Now().Add(60 * time.Second))
 		}
+		removeConnection(client)
 	}()
-
 	<-done
-	removeConnection(c)
+	removeConnection(client)
 }
 
-func getShardIndex(c *websocket.Conn) int {
-	return int(uintptr(unsafe.Pointer(c)) % uintptr(CONN_SHARDS))
+func getShardIndex(client *Client) int {
+	return int(uintptr(unsafe.Pointer(client.conn)) % uintptr(CONN_SHARDS))
 }
 
-func addConnection(c *websocket.Conn) bool {
+func addConnection(client *Client) bool {
 	if atomic.LoadInt64(&connCount) >= int64(MAX_CONNECTIONS) {
 		return false
 	}
-	idx := getShardIndex(c)
+	idx := getShardIndex(client)
 	shard := connShards[idx]
 	shard.Lock()
-	shard.conns[c] = struct{}{}
+	shard.clients[client] = struct{}{}
 	shard.Unlock()
 	atomic.AddInt64(&connCount, 1)
 	return true
 }
 
-func removeConnection(c *websocket.Conn) {
-	idx := getShardIndex(c)
+func removeConnection(client *Client) {
+	idx := getShardIndex(client)
 	shard := connShards[idx]
 	shard.Lock()
-	if _, ok := shard.conns[c]; ok {
-		delete(shard.conns, c)
+	if _, ok := shard.clients[client]; ok {
+		delete(shard.clients, client)
 		atomic.AddInt64(&connCount, -1)
 	}
 	shard.Unlock()
-	c.Close()
+	defer func() { recover() }()
+	close(client.sendCh)
+	client.conn.Close()
 }
 
 func getClientIP(c *fiber.Ctx) string {
@@ -417,23 +431,19 @@ func getStateBytes() []byte {
 			return data
 		}
 	}
-
 	stateCacheMu.Lock()
 	defer stateCacheMu.Unlock()
-
 	now := time.Now().UnixNano()
 	if cached := stateCache.Load(); cached != nil {
 		if now-atomic.LoadInt64(&stateCacheAt) < int64(STATE_CACHE_TTL) {
 			return cached.([]byte)
 		}
 	}
-
 	state := State{
 		History:       buildHistoryData(),
 		UsdIdrHistory: buildUsdIdrData(),
 		LimitBulan:    atomic.LoadInt64(&limitBulan),
 	}
-
 	buf := bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	enc := json.NewEncoder(buf)
@@ -441,7 +451,6 @@ func getStateBytes() []byte {
 	b := make([]byte, buf.Len())
 	copy(b, buf.Bytes())
 	bufferPool.Put(buf)
-
 	stateCache.Store(b)
 	atomic.StoreInt64(&stateCacheAt, now)
 	return b
@@ -464,35 +473,33 @@ func broadcastWorker() {
 	for range broadcastCh {
 		time.Sleep(BROADCAST_DEBOUNCE)
 		atomic.StoreInt32(&broadcastPending, 0)
-
 		msg := getStateBytes()
 		if len(msg) == 0 {
 			continue
 		}
-
 		var wg sync.WaitGroup
 		for _, shard := range connShards {
 			shard.RLock()
-			if len(shard.conns) == 0 {
+			if len(shard.clients) == 0 {
 				shard.RUnlock()
 				continue
 			}
-			conns := make([]*websocket.Conn, 0, len(shard.conns))
-			for c := range shard.conns {
-				conns = append(conns, c)
+			clients := make([]*Client, 0, len(shard.clients))
+			for c := range shard.clients {
+				clients = append(clients, c)
 			}
 			shard.RUnlock()
-
 			wg.Add(1)
-			go func(conns []*websocket.Conn) {
+			go func(clients []*Client) {
 				defer wg.Done()
-				for _, c := range conns {
-					c.SetWriteDeadline(time.Now().Add(WS_WRITE_TIMEOUT))
-					if err := c.WriteMessage(websocket.BinaryMessage, msg); err != nil {
-						go removeConnection(c)
+				for _, client := range clients {
+					select {
+					case client.sendCh <- msg:
+					default:
+						go removeConnection(client)
 					}
 				}
-			}(conns)
+			}(clients)
 		}
 		wg.Wait()
 	}
@@ -506,7 +513,6 @@ func apiLoop() {
 		DisableKeepAlives:   false,
 	}
 	client := &http.Client{Timeout: 6 * time.Second, Transport: transport}
-
 	for {
 		result := fetchTreasuryPrice(client)
 		if result != nil {
@@ -532,7 +538,6 @@ func apiLoop() {
 							diff = 0
 							status = "➖"
 						}
-
 						historyMu.Lock()
 						if len(history) >= MAX_HISTORY {
 							history = history[1:]
@@ -545,7 +550,6 @@ func apiLoop() {
 							CreatedAt:   upd,
 						})
 						historyMu.Unlock()
-
 						atomic.StoreInt64(&lastBuy, int64(buy))
 						shownUpdates.Store(upd, true)
 						invalidateStateCache()
@@ -585,7 +589,6 @@ func usdIdrLoop() {
 		IdleConnTimeout:     90 * time.Second,
 	}
 	client := &http.Client{Timeout: 6 * time.Second, Transport: transport}
-
 	for {
 		price := fetchUsdIdrPrice(client)
 		if price != "" {
@@ -641,18 +644,17 @@ func heartbeatLoop() {
 	pingMsg := []byte(`{"ping":true}`)
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		if atomic.LoadInt64(&connCount) == 0 {
 			continue
 		}
-
 		for _, shard := range connShards {
 			shard.RLock()
-			for c := range shard.conns {
-				c.SetWriteDeadline(time.Now().Add(WS_WRITE_TIMEOUT))
-				if err := c.WriteMessage(websocket.BinaryMessage, pingMsg); err != nil {
-					go removeConnection(c)
+			for client := range shard.clients {
+				select {
+				case client.sendCh <- pingMsg:
+				default:
+					go removeConnection(client)
 				}
 			}
 			shard.RUnlock()
@@ -821,7 +823,6 @@ th.waktu,td.waktu{width:60px;min-width:50px;max-width:70px}
 .card-calendar{height:auto;padding:0}
 .calendar-section{margin:20px 0 45px 0}
 .calendar-wrap{margin:0 -10px;padding:0 10px;width:calc(100% + 20px)}
-.calendar-iframe{height:350px;min-width:600px}
 #footerApp{padding:5px 0}
 .marquee-text{font-size:12px}
 .dt-top-controls{gap:3px;margin-bottom:6px}
@@ -903,4 +904,3 @@ th.waktu,td.waktu{width:60px;min-width:50px;max-width:70px}
 </script>
 </body>
 </html>`
-
