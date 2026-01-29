@@ -248,10 +248,7 @@ func wsHandler(c *websocket.Conn) {
 				break
 			}
 			if len(msg) == 4 && string(msg) == "ping" {
-				select {
-				case client.sendCh <- []byte(`{"pong":true}`):
-				default:
-				}
+				safeSend(client, []byte(`{"pong":true}`))
 			}
 			c.SetReadDeadline(time.Now().Add(60 * time.Second))
 		}
@@ -290,6 +287,15 @@ func removeConnection(client *Client) {
 	defer func() { recover() }()
 	close(client.sendCh)
 	client.conn.Close()
+}
+
+func safeSend(client *Client, msg []byte) {
+	defer func() { recover() }()
+	select {
+	case client.sendCh <- msg:
+	default:
+		go removeConnection(client)
+	}
 }
 
 func getClientIP(c *fiber.Ctx) string {
@@ -470,6 +476,7 @@ func triggerBroadcast() {
 }
 
 func broadcastWorker() {
+	defer func() { recover() }()
 	for range broadcastCh {
 		time.Sleep(BROADCAST_DEBOUNCE)
 		atomic.StoreInt32(&broadcastPending, 0)
@@ -493,11 +500,7 @@ func broadcastWorker() {
 			go func(clients []*Client) {
 				defer wg.Done()
 				for _, client := range clients {
-					select {
-					case client.sendCh <- msg:
-					default:
-						go removeConnection(client)
-					}
+					safeSend(client, msg)
 				}
 			}(clients)
 		}
@@ -641,6 +644,7 @@ func fetchUsdIdrPrice(client *http.Client) string {
 }
 
 func heartbeatLoop() {
+	defer func() { recover() }()
 	pingMsg := []byte(`{"ping":true}`)
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
@@ -651,11 +655,7 @@ func heartbeatLoop() {
 		for _, shard := range connShards {
 			shard.RLock()
 			for client := range shard.clients {
-				select {
-				case client.sendCh <- pingMsg:
-				default:
-					go removeConnection(client)
-				}
+				safeSend(client, pingMsg)
 			}
 			shard.RUnlock()
 		}
